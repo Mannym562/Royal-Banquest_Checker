@@ -1,13 +1,13 @@
 """
-Royal Banquet (Disneyland Paris) availability checker -- GitHub Actions version.
+Disneyland Paris restaurant availability checker -- GitHub Actions version.
 
-Unlike the original version, this script does ONE check and then exits.
-GitHub Actions is what handles "run this every 10 minutes" -- see
-.github/workflows/check.yml in this same repo.
+Watches one or more restaurants at once. Each "watch" can either alert on
+ANY open time slot for its dates/party size, or be narrowed to only alert
+for specific times (e.g. only an 11:45 AM slot, ignore everything else
+that opens that day).
 
-Email credentials are read from environment variables (set as GitHub
-Secrets), not hardcoded in this file, so nothing sensitive ends up in your
-repo.
+Does ONE check and exits -- GitHub Actions (or cron-job.org calling
+workflow_dispatch) handles running it every 10 minutes.
 """
 
 import json
@@ -21,9 +21,29 @@ import requests
 
 # ============================== CONFIG ==================================
 
-RESTAURANT_ID = "H01R02"  # Royal Banquet
-TARGET_DATES = ["2026-09-25", "2026-09-26", "2026-09-27"]
-PARTY_SIZES = [4, 6]
+WATCHES = [
+    {
+        "name": "Royal Banquet",
+        "restaurant_id": "H01R02",
+        "dates": ["2026-09-25", "2026-09-26", "2026-09-27"],
+        "party_sizes": [4, 6],
+        "only_times": None,  # None = alert on ANY open time
+    },
+    {
+        "name": "Agrabah Cafe",
+        "restaurant_id": "P1AR06",
+        "dates": ["2026-09-26"],
+        "party_sizes": [2],
+        "only_times": ["11:45 AM"],  # ONLY alert if this exact slot opens
+    },
+    {
+        "name": "Pym Kitchen",
+        "restaurant_id": "P2AR02",
+        "dates": ["2026-09-26"],
+        "party_sizes": [2],
+        "only_times": ["03:30 PM"],  # ONLY alert if this exact slot opens
+    },
+]
 
 # Disney's public front-end API key (seen in the site's own network traffic --
 # not a login credential, just what their web page uses to call its own API)
@@ -32,12 +52,12 @@ X_API_KEY = "AaQHDoRgDa66dl2PQuTEe9DjyBlH8ylV4LxnldFY"
 # --- Email settings, pulled from GitHub Secrets at run time ---
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-# NOTIFY_EMAIL secret can be one address, or several separated by commas
 NOTIFY_EMAIL = [e.strip() for e in os.environ["NOTIFY_EMAIL"].split(",")]
 
 # ==========================================================================
 
 API_URL = "https://dlp-is-sales-drs-book-dine.wdprapps.disney.com/prod/v4/book-dine/availabilities/en-usd"
+BOOKING_URL_TEMPLATE = "https://bookrestaurants.disneylandparis.com/en-usd?id={restaurant_id}"
 STATE_FILE = Path(__file__).parent / "seen_slots.json"
 
 HEADERS = {
@@ -65,11 +85,12 @@ def save_seen_slots(slots: set) -> None:
     STATE_FILE.write_text(json.dumps(sorted(slots)))
 
 
-def check_one(date: str, party_size: int) -> list[str]:
+def check_one(restaurant_id: str, date: str, party_size: int) -> list[tuple[str, str]]:
+    """Returns list of (meal_period, time) tuples that are currently available."""
     payload = {
         "partyMix": party_size,
         "session": 0,
-        "restaurantId": RESTAURANT_ID,
+        "restaurantId": restaurant_id,
         "sourceSite": "web",
         "date": date,
     }
@@ -77,13 +98,13 @@ def check_one(date: str, party_size: int) -> list[str]:
     resp.raise_for_status()
     data = resp.json()
 
-    available_times = []
+    available = []
     for entry in data:
         for meal_period in entry.get("mealPeriods", []):
             for slot in meal_period.get("slotList", []):
                 if str(slot.get("available")).lower() == "true":
-                    available_times.append(f"{meal_period['mealPeriod']} {slot['time']}")
-    return available_times
+                    available.append((meal_period["mealPeriod"], slot["time"]))
+    return available
 
 
 def send_email(subject: str, body: str) -> None:
@@ -99,30 +120,43 @@ def send_email(subject: str, body: str) -> None:
 
 def main():
     seen_slots = load_seen_slots()
-    newly_found = []
+    newly_found = []  # (restaurant_name, restaurant_id, date, party_size, meal_period, time)
 
-    for date in TARGET_DATES:
-        for party_size in PARTY_SIZES:
-            try:
-                available = check_one(date, party_size)
-            except Exception as e:
-                log(f"ERROR checking {date} / party {party_size}: {e}")
-                continue
+    for watch in WATCHES:
+        name = watch["name"]
+        restaurant_id = watch["restaurant_id"]
+        only_times = watch.get("only_times")
 
-            log(f"{date} party {party_size}: {available if available else 'nothing open'}")
+        for date in watch["dates"]:
+            for party_size in watch["party_sizes"]:
+                try:
+                    available = check_one(restaurant_id, date, party_size)
+                except Exception as e:
+                    log(f"ERROR checking {name} {date} / party {party_size}: {e}")
+                    continue
 
-            for time_str in available:
-                key = f"{date}|{party_size}|{time_str}"
-                if key not in seen_slots:
-                    newly_found.append((date, party_size, time_str))
-                    seen_slots.add(key)
+                if only_times:
+                    available = [(mp, t) for mp, t in available if t in only_times]
+
+                log(f"{name} {date} party {party_size}: "
+                    f"{available if available else 'nothing matching'}")
+
+                for meal_period, time_str in available:
+                    key = f"{restaurant_id}|{date}|{party_size}|{time_str}"
+                    if key not in seen_slots:
+                        newly_found.append(
+                            (name, restaurant_id, date, party_size, meal_period, time_str)
+                        )
+                        seen_slots.add(key)
 
     if newly_found:
-        lines = [f"- {d}, party of {p}, {t}" for d, p, t in newly_found]
-        body = "New Royal Banquet openings just appeared:\n\n" + "\n".join(lines)
-        body += "\n\nBook now: https://bookrestaurants.disneylandparis.com/en-usd?id=H01R02"
+        lines = []
+        for name, restaurant_id, date, party_size, meal_period, time_str in newly_found:
+            link = BOOKING_URL_TEMPLATE.format(restaurant_id=restaurant_id)
+            lines.append(f"- {name}: {date}, party of {party_size}, {meal_period} {time_str}\n  {link}")
+        body = "New restaurant openings just appeared:\n\n" + "\n\n".join(lines)
         try:
-            send_email("Royal Banquet table just opened up!", body)
+            send_email("A watched restaurant slot just opened up!", body)
             log(f"Email sent for {len(newly_found)} new slot(s).")
         except Exception as e:
             log(f"ERROR sending email: {e}")
